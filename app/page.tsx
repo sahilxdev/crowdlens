@@ -1,103 +1,192 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-
-interface PromptData {
-  prompt: string;
-  flawedResponse: string;
-}
-
-const sampleData: PromptData[] = [
-  {
-    prompt: "Explain quantum computing in simple terms",
-    flawedResponse: "Quantum computing uses quantum bits (qbits) that can be 0 and 1 simultaneously, like regular bits in classical computers."
-  },
-  {
-    prompt: "Describe the process of photosynthesis",
-    flawedResponse: "Plants convert sunlight into oxygen through a process called photosythesis in their roots."
-  }
-];
+import PromptDisplay from './components/PromptDisplay';
+import ResponseEditor from './components/ResponseEditor';
+import AccountStatus from './components/AccountStatus';
+import FeedbackMessage from './components/FeedbackMessage';
+import ValidationStatus from './components/ValidationStatus';
+import { fetchRandomPrompt, PromptData } from '@/lib/data';
+import { submitCorrection, SubmissionPayload } from '@/lib/api';
+import Loading from './loading';
+import { useSearchParams, useRouter } from 'next/navigation';
+import { supabase } from '@/lib/supabaseClient';
 
 export default function Home() {
-  const [currentPrompt, setCurrentPrompt] = useState<PromptData>(sampleData[0]);
+  const [currentPrompt, setCurrentPrompt] = useState<PromptData | null>(null);
   const [editedResponse, setEditedResponse] = useState<string>('');
   const [balance, setBalance] = useState<number>(100);
   const [submissionStatus, setSubmissionStatus] = useState<'correct' | 'incorrect' | null>(null);
+  const [validationStatus, setValidationStatus] = useState<{ isValid: boolean | null; adherencePercentage: number | null }>({
+    isValid: null,
+    adherencePercentage: null
+  });
+  const [loading, setLoading] = useState(true);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const searchParams = useSearchParams();
+  const datasetId = searchParams.get('datasetId');
+  const router = useRouter();
+  const [apiError, setApiError] = useState<string | null>(null);
 
   useEffect(() => {
-    loadNextPrompt();
-  }, []);
+    const loadInitialPrompt = async () => {
+      if (!datasetId) {
+        router.push('/datasets');
+        return;
+      }
+      setLoading(true);
+      try {
+        const prompt = await fetchRandomPrompt(datasetId);
+        setCurrentPrompt(prompt);
+        setEditedResponse(prompt.flawedResponse);
+        setLoading(false);
+      } catch (error) {
+        console.error("Error loading initial prompt:", error);
+        setLoading(false);
+      }
+    };
 
-  const loadNextPrompt = () => {
-    const next = sampleData[Math.floor(Math.random() * sampleData.length)];
-    setCurrentPrompt(next);
-    setEditedResponse(next.flawedResponse);
-  };
+    loadInitialPrompt();
+  }, [datasetId, router]);
 
-  const handleSubmission = async () => {
+  const loadNextPrompt = async () => {
+    if(!datasetId) return;
     try {
-      const isValid = editedResponse.trim() !== currentPrompt.flawedResponse.trim();
-      
-      setSubmissionStatus(isValid ? 'correct' : 'incorrect');
-      setBalance(prev => isValid ? prev + 10 : prev - 5);
-
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      loadNextPrompt();
+      const next = await fetchRandomPrompt(datasetId);
+      setCurrentPrompt(next);
+      setEditedResponse(next.flawedResponse);
       setSubmissionStatus(null);
-      
+      setValidationStatus({ isValid: null, adherencePercentage: null });
     } catch (error) {
-      console.error('Submission error:', error);
-      setSubmissionStatus('incorrect');
+      console.error('Error loading next prompt:', error);
     }
   };
+
+  const validateWithGemini = async () => {
+    if (!currentPrompt) return null;
+    
+    try {
+      const response = await fetch('/api/validate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          prompt: currentPrompt.prompt,
+          originalResponse: currentPrompt.flawedResponse,
+          correctedResponse: editedResponse,
+        }),
+      });
+
+      const result = await response.json();
+      
+      if (!response.ok) {
+        throw new Error(result.error || 'Validation failed');
+      }
+
+      return result;
+    } catch (error) {
+      if (error instanceof Error) {
+        setApiError(error.message);
+      } else {
+        setApiError('An unexpected error occurred');
+      }
+      console.error('Validation error:', error);
+      return null;
+    }
+  };
+
+  const handleValidation = async () => {
+    if (!currentPrompt || isSubmitting) return;
+    setIsSubmitting(true);
+    setApiError(null);
+
+    try {
+      const validationResult = await validateWithGemini();
+      
+      if (!validationResult) {
+        setValidationStatus({
+          isValid: false,
+          adherencePercentage: 0
+        });
+        return;
+      }
+
+      setValidationStatus({
+        isValid: validationResult.isValid,
+        adherencePercentage: validationResult.adherencePercentage
+      });
+
+      if (validationResult.isValid) {
+        const payload: SubmissionPayload = {
+          promptId: currentPrompt.id,
+          originalResponse: currentPrompt.flawedResponse,
+          editedResponse: editedResponse,
+          timestamp: Date.now(),
+        };
+
+        await submitCorrection(payload);
+        setSubmissionStatus('correct');
+        setBalance(prev => prev + 10);
+
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        await loadNextPrompt();
+      }
+    } catch (error) {
+      console.error('Validation error:', error);
+      if (error instanceof Error) {
+        setApiError(error.message);
+      } else {
+        setApiError('An unexpected error occurred');
+      }
+      setValidationStatus({
+        isValid: false,
+        adherencePercentage: 0
+      });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  if(loading) return <Loading />;
+  if(!currentPrompt) return <div>Error loading data, please select a dataset first <a href="/datasets">Go to datasets</a></div>;
 
   return (
     <main className="min-h-screen p-8 grid grid-cols-1 md:grid-cols-3 gap-6">
       {/* Left Column - Prompt & AI Response */}
       <div className="border rounded-lg p-4 flex flex-col h-[90vh]">
-        <div className="h-1/4 border-b pb-4 mb-4">
-          <h2 className="text-lg font-bold mb-2">Current Prompt</h2>
-          <div className="bg-gray-100 p-3 rounded text-gray-800">
-            {currentPrompt.prompt}
-          </div>
-        </div>
-        <div className="flex-1 overflow-auto">
-          <h2 className="text-lg font-bold mb-2">AI Response</h2>
-          <div className="bg-red-50 p-3 rounded text-red-800">
-            {currentPrompt.flawedResponse}
-          </div>
-        </div>
-      </div>
-
-      {/* Middle Column - Editable Response */}
-      <div className="border rounded-lg p-4 flex flex-col">
-        <h2 className="text-lg font-bold mb-2">Edit Response</h2>
-        <textarea
-          className="w-full text-slate-700 flex-1 p-3 border rounded resize-none"
-          value={editedResponse}
-          onChange={(e) => setEditedResponse(e.target.value)}
-          placeholder="Edit the flawed response here..."
+        <PromptDisplay
+          prompt={currentPrompt.prompt}
+          flawedResponse={currentPrompt.flawedResponse}
         />
       </div>
 
+      {/* Middle Column - Editable Response */}
+      <ResponseEditor
+        editedResponse={editedResponse}
+        onChange={(e) => setEditedResponse(e.target.value)}
+      />
+
       {/* Right Column - Account & Submission */}
       <div className="border rounded-lg p-4 flex flex-col">
-        <div className="mb-8">
-          <h2 className="text-lg font-bold mb-2">Account Balance</h2>
-          <div className="text-xl font-mono">${balance}</div>
-        </div>
-        <button
-          onClick={handleSubmission}
-          className="mt-auto bg-blue-600 text-white py-3 rounded-lg hover:bg-blue-700 transition-colors disabled:bg-gray-400"
-          disabled={!!submissionStatus}
-        >
-          Submit Correction
-        </button>
-        {submissionStatus && (
-          <div className={`mt-4 p-2 rounded text-center ${submissionStatus === 'correct' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}`}>
-            {submissionStatus.toUpperCase()}!
+        <AccountStatus balance={balance} />
+        {apiError && (
+          <div className="mb-4 p-3 bg-red-100 border border-red-400 text-red-700 rounded">
+            {apiError}
           </div>
         )}
+        <button
+          onClick={handleValidation}
+          className="mt-auto bg-blue-600 text-white py-3 rounded-lg hover:bg-blue-700 transition-colors disabled:bg-gray-400"
+          disabled={isSubmitting}
+        >
+          {isSubmitting ? 'Validating...' : 'Validate & Submit Correction'}
+        </button>
+        <ValidationStatus 
+          isValid={validationStatus.isValid} 
+          adherencePercentage={validationStatus.adherencePercentage} 
+        />
+        <FeedbackMessage status={submissionStatus} />
       </div>
     </main>
   );
